@@ -30,17 +30,26 @@ import sys
 import os
 
 # Playwright normally stores its downloaded browser in a stable per-user
-# cache. When this script is frozen into a PyInstaller --onefile .exe,
-# Playwright's path lookup can instead resolve to the exe's temporary
-# extraction folder (%TEMP%\_MEIxxxxx), which is deleted after every run --
-# so the browser it finds there is missing on the next launch. Pinning
-# PLAYWRIGHT_BROWSERS_PATH to a fixed, persistent folder avoids that. This
-# MUST be set before `playwright` is imported, and the same folder must be
-# used when running `playwright install chromium` (see README).
-os.environ.setdefault(
-    "PLAYWRIGHT_BROWSERS_PATH",
-    os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "JobSearchGUI", "pw-browsers"),
-)
+# cache. When this script is frozen into a PyInstaller --onefile executable
+# (.exe on Windows, .app on macOS), Playwright's path lookup can instead
+# resolve to the app's temporary extraction folder, which is deleted after
+# every run -- so the browser it finds there is missing on the next launch.
+# Pinning PLAYWRIGHT_BROWSERS_PATH to a fixed, persistent, OS-appropriate
+# folder avoids that. This MUST be set before `playwright` is imported, and
+# the same folder must be used when running `playwright install chromium`
+# (see README).
+def _default_playwright_browsers_dir() -> str:
+    home = os.path.expanduser("~")
+    if sys.platform.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA", home)
+    elif sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME", os.path.join(home, ".local", "share"))
+    return os.path.join(base, "JobSearchGUI", "pw-browsers")
+
+
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", _default_playwright_browsers_dir())
 
 from playwright.sync_api import sync_playwright
 import re

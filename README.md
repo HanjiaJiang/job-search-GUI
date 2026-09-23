@@ -44,7 +44,36 @@ If Indeed still reports "Executable doesn't exist" from the .exe:
    `chromium_headless_shell-*` (or `chromium-*`) folder — if not, the
    install step above didn't complete successfully.
 
-## Known limitations
+## Building a macOS app (no Mac required, via GitHub Actions)
+PyInstaller can't cross-compile — a macOS app must be built *on* macOS. This
+repo includes `.github/workflows/build-macos.yml`, which builds it for you
+on GitHub's own free macOS runners.
+
+1. Push this project to a GitHub repository (create one if you don't have
+   one yet: `git init`, `git add .`, `git commit -m "initial"`, then create
+   a repo on github.com and push).
+2. On GitHub, open the **Actions** tab. The workflow runs automatically on
+   every push to `main`, or click **Build macOS App → Run workflow** to
+   trigger it manually.
+3. When it finishes (a few minutes), open the completed run and download
+   the **JobSearchGUI-macOS** artifact — a zip containing `JobSearchGUI.app`.
+4. On a Mac: unzip it, then **right-click → Open** the first time (macOS
+   blocks unsigned apps from opening via double-click, since this isn't
+   code-signed/notarized — right-click → Open shows an "Open anyway" option).
+
+### One-time browser setup on macOS (required before Indeed works)
+Same underlying issue as the Windows .exe: Playwright's browser must live in
+a fixed, persistent folder, not wherever the app happens to unpack itself.
+On the Mac that will run the app, open Terminal and run once:
+```
+export PLAYWRIGHT_BROWSERS_PATH="$HOME/Library/Application Support/JobSearchGUI/pw-browsers"
+pip install playwright
+playwright install chromium
+```
+(Any Python with `pip` works for this step — it just needs to write to that
+folder; it doesn't need to be the same Python used to build the app.)
+
+
 - Indeed blocks plain HTTP requests (403), so Indeed searches launch a real
   headless Chromium browser via Playwright — slower than LinkedIn's requests-
   based search, and it paginates through result pages (capped at ~20 pages)
