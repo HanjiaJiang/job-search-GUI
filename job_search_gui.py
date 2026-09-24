@@ -70,7 +70,7 @@ DEFAULT_QUERIES = [
     "brain computer interface",
 ]
 
-DEFAULT_GROUP1 = "engineer, scientist, software, simulation, python, C++, algorithm, algorithms"
+DEFAULT_GROUP1 = "engineer, scientist, software, simulation, python, C++, algorithm"
 DEFAULT_GROUP2 = "biomed, medic, clinical, biolog, physio, neural, neuro, biophysic"
 
 HEADERS = {
@@ -374,8 +374,7 @@ class JobSearchApp:
         row += 1
         self.broad_match_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            frm, text="Broad match (substring, e.g. 'neuro' also matches 'neurotech') — "
-                      "default is whole-word only",
+            frm, text="Broad match (substring, e.g. 'neuro' also matches 'neurotech')",
             variable=self.broad_match_var
         ).grid(row=row, column=0, columnspan=2, sticky="w", pady=3)
 
