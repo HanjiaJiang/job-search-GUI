@@ -4,7 +4,9 @@ Job Search GUI - Indeed & LinkedIn
 Searches Indeed and LinkedIn for up to 5 user-defined queries, restricted to a
 date range (days back from today), an optional keyword-group filter verified
 against each job's full posting text, and writes the found job-posting URLs
-to .txt files inside a dated results folder. Indeed and LinkedIn are run
+to .txt files inside a dated results folder. Optionally also saves each
+posting's text (title, company, location, description) to a .md file per query,
+since AI tools generally cannot open Indeed/LinkedIn URLs themselves. Indeed and LinkedIn are run
 separately (separate buttons) so one engine's issues don't block the other.
 
 NOTE ON RELIABILITY:
@@ -28,6 +30,7 @@ import requests
 from bs4 import BeautifulSoup
 import sys
 import os
+import json
 
 # Playwright normally stores its downloaded browser in a stable per-user
 # cache. When this script is frozen into a PyInstaller --onefile executable
@@ -61,6 +64,8 @@ from urllib.parse import quote_plus
 
 RESULTS_PER_PAGE = 10   # Indeed's pagination step
 PAGE_SAFETY_CAP = 300   # stop after ~20 pages even if more exist
+FALLBACK_TEXT_LIMIT = 8000       # max chars saved when only whole-page text was found
+BLOCKED_PAGE_MIN_CHARS = 300     # whole-page text shorter than this = probably a block page
 
 DEFAULT_QUERIES = [
     "biomedical python",
@@ -144,81 +149,360 @@ def keyword_groups_match(text: str, group1: list, group2: list, broad_match: boo
     )
 
 
-def extract_main_text(soup: BeautifulSoup, engine: str):
-    """Returns (text, used_fallback). Scopes text to the job title + the actual
-    description container, so sidebar content (similar/related jobs, nav, JSON-LD,
-    etc.) can't cause false-positive keyword matches. Falls back to the whole page
-    only if the expected container isn't found (e.g. the site changed its markup),
-    in which case used_fallback is True so callers can flag it."""
-    title_tag = soup.find("h1")
-    title = title_tag.get_text(" ", strip=True) if title_tag else ""
+def _extract_json_string_field(html: str, key: str) -> str | None:
+    """Indeed's search-results page embeds the full HTML description of the
+    currently 'opened' job as an escaped JSON string inside its bundled JS
+    (not a clean top-level JSON blob), keyed e.g. "sanitizedJobDescription".
+    This scans for `"<key>":"` and parses the string literal by hand,
+    respecting backslash escapes, then JSON-decodes it. Returns None if the
+    key isn't present on the page."""
+    needle = f'"{key}":"'
+    pos = html.find(needle)
+    if pos == -1:
+        return None
+    i = pos + len(needle)
+    while i < len(html):
+        c = html[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == '"':
+            break
+        i += 1
+    try:
+        return json.loads('"' + html[pos + len(needle):i] + '"')
+    except Exception:
+        return None
 
+
+def jk_from_url(url: str) -> str:
+    m = re.search(r"jk=([0-9a-fA-F]+)", url)
+    return m.group(1) if m else ""
+
+
+DESCRIPTION_JSON_KEYS = ["sanitizedJobDescription", "descriptionContent"]
+
+
+def fetch_indeed_description_via_search(page, domain: str, query: str, days: int, jk: str,
+                                         log, debug_dir=None, dump_count=None) -> tuple[str, bool]:
+    """Loads the search-results page with &vjk=<jk>, which is how Indeed's desktop
+    split-view embeds that job's full HTML description as JSON for instant render.
+    This stays on the /jobs search endpoint - unlike /viewjob, which redirects this
+    script's traffic to a login wall - so it's the workaround for reading full
+    descriptions without ever hitting the blocked endpoint. Returns (description, ok).
+    """
+    url = f"https://{domain}/jobs?q={quote_plus(query)}&fromage={days}&vjk={jk}"
+    try:
+        page.goto(url, timeout=30000)
+        page.wait_for_timeout(1500)
+        html = page.content()
+        for key in DESCRIPTION_JSON_KEYS:
+            desc_html = _extract_json_string_field(html, key)
+            if desc_html:
+                return _block_text(BeautifulSoup(desc_html, "html.parser")), True
+        # No embedded description found - dump for inspection, capped per query.
+        if debug_dir is not None and dump_count is not None and dump_count[0] < DEBUG_DUMP_LIMIT:
+            os.makedirs(debug_dir, exist_ok=True)
+            with open(os.path.join(debug_dir, f"debug_{dump_count[0] + 1}.html"), "w", encoding="utf-8") as f:
+                f.write(html)
+            dump_count[0] += 1
+        return "", False
+    except Exception as e:
+        log(f"    Could not load full description for job {jk}: {e}")
+        return "", False
+
+
+def _first_text(soup, selectors):
+    """Text of the first CSS selector that matches a non-empty element, else ''."""
+    for sel in selectors:
+        el = soup.select_one(sel)
+        if el:
+            t = el.get_text(" ", strip=True)
+            if t:
+                return t
+    return ""
+
+
+def _block_text(el) -> str:
+    """Text of an element with paragraph/line/bullet structure kept, without splitting
+    inline tags (<b>, <a>, ...) onto their own lines."""
+    for br in el.find_all("br"):
+        br.replace_with("\n")
+    for li in el.find_all("li"):
+        li.insert(0, "- ")
+    for blk in el.find_all(["p", "li", "div", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6"]):
+        blk.append("\n")
+    text = el.get_text("")
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r" ?\n ?", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def extract_job_details(soup: BeautifulSoup, engine: str) -> dict:
+    """Extracts title, company, location and description from a job page.
+    The description is scoped to the actual description container, so sidebar
+    content (similar/related jobs, nav, JSON-LD, etc.) can't cause false-positive
+    keyword matches or end up in the saved text. Falls back to the whole page
+    only if the container isn't found (e.g. the site changed its markup); in
+    that case used_fallback is True so callers can flag it."""
+    title = _first_text(soup, ["h1"])
+    company = location = ""
     container = None
+
     if engine == "indeed":
+        company = _first_text(soup, [
+            '[data-testid="inlineHeader-companyName"]', '[data-company-name="true"]'])
+        location = _first_text(soup, [
+            '[data-testid="inlineHeader-companyLocation"]', '[data-testid="job-location"]'])
         container = soup.find(id="jobDescriptionText")
         if not container:
+            container = soup.find(attrs={"data-testid": "jobDescriptionText"})
+        if not container:
             container = soup.find("div", class_=lambda c: c and "jobsearch-jobDescriptionText" in c)
+        if not container:
+            container = soup.find("div", class_=lambda c: c and "jobsearch-JobComponent-description" in c)
     elif engine == "linkedin":
+        company = _first_text(soup, ["a.topcard__org-name-link", "span.topcard__flavor"])
+        location = _first_text(soup, ["span.topcard__flavor--bullet"])
         container = soup.find("div", class_=lambda c: c and "show-more-less-html__markup" in c)
         if not container:
             container = soup.find("div", class_=lambda c: c and "description__text" in c)
 
     if container:
-        return f"{title} {container.get_text(' ', strip=True)}", False
-    return soup.get_text(" ", strip=True), True
+        description, used_fallback = _block_text(container), False
+    else:
+        description, used_fallback = soup.get_text("\n", strip=True), True
+
+    return {
+        "title": title, "company": company, "location": location,
+        "description": description, "used_fallback": used_fallback,
+        "blocked": _looks_blocked(soup),
+    }
 
 
-def get_page_text_playwright(page, url: str, engine: str, log):
-    """Returns (text, used_fallback)."""
+BLOCK_PAGE_MARKERS = [
+    "verifying you are human", "additional verification required",
+    "just a moment", "checking your browser",
+    "bestätigen sie, dass sie ein mensch sind", "zusätzliche überprüfung erforderlich",
+    "please verify you are a human", "access denied",
+    # Indeed's login wall, seen redirecting /viewjob?jk=... to a sign-in page
+    "ready to take the next step", "create an account or sign in",
+    "erstellen sie ein indeed-konto", "sign in | indeed",
+]
+
+
+def _looks_blocked(soup) -> bool:
+    """True if the page text matches known bot-check / consent-wall phrasing,
+    so a missing description container can be reported as 'likely blocked'
+    rather than a silent parsing miss."""
+    head = soup.get_text(" ", strip=True)[:2000].lower()
+    return any(marker in head for marker in BLOCK_PAGE_MARKERS)
+
+
+def _empty_record(url: str) -> dict:
+    return {"url": url, "title": "", "company": "", "location": "",
+            "description": "", "used_fallback": False, "blocked": False, "ok": False}
+
+
+def _fill_record(record: dict, html: str, engine: str) -> dict:
+    record.update(extract_job_details(BeautifulSoup(html, "html.parser"), engine))
+    # Flag as not-ok if the page matched a known block/consent phrase, or if the
+    # only text we got was a short whole-page fallback (likely the same thing
+    # without matching phrasing).
+    record["ok"] = not (
+        record["blocked"]
+        or (record["used_fallback"] and len(record["description"]) < BLOCKED_PAGE_MIN_CHARS)
+    )
+    return record
+
+
+DEBUG_DUMP_LIMIT = 3  # save at most this many raw HTML pages per query, for inspection
+
+
+def _maybe_dump_debug_html(record: dict, html: str, debug_dir, dump_count: list):
+    """Saves the raw HTML of a page that came back blocked/unreadable, up to
+    DEBUG_DUMP_LIMIT per query, so the actual markup can be inspected by hand
+    when extraction silently fails."""
+    if debug_dir is None or record["ok"] or dump_count[0] >= DEBUG_DUMP_LIMIT:
+        return
+    os.makedirs(debug_dir, exist_ok=True)
+    fname = f"debug_{dump_count[0] + 1}.html"
+    with open(os.path.join(debug_dir, fname), "w", encoding="utf-8") as f:
+        f.write(html)
+    dump_count[0] += 1
+
+
+def fetch_details_playwright(page, url: str, engine: str, log, debug_dir=None, dump_count=None,
+                              referer=None) -> dict:
+    """Loads a job page in the browser and returns a record dict (see _empty_record).
+    referer, if given, is sent as the HTTP Referer header - some sites (Indeed
+    included) treat a direct goto() with no referer as more bot-like than a
+    "click" arriving from their own search results page."""
+    record = _empty_record(url)
     try:
-        page.goto(url, timeout=30000)
-        page.wait_for_timeout(1000)
-        soup = BeautifulSoup(page.content(), "html.parser")
-        return extract_main_text(soup, engine)
+        if referer:
+            page.goto(url, timeout=30000, referer=referer)
+        else:
+            page.goto(url, timeout=30000)
+        _accept_cookie_consent(page)
+        try:
+            page.wait_for_selector(
+                "#jobDescriptionText, [data-testid=\"jobDescriptionText\"]", timeout=4000)
+        except Exception:
+            pass  # container never showed up - fall through, extraction will flag it
+        page.wait_for_timeout(500)
+        html = page.content()
+        _fill_record(record, html, engine)
+        # Strongest signal of all: we got redirected clean off the job page (e.g.
+        # to a login wall or an /auth error), whatever that landing page's text says.
+        jk_match = re.search(r"jk=([0-9a-fA-F]+)", url)
+        if jk_match and jk_match.group(1) not in page.url:
+            record["blocked"], record["ok"] = True, False
+        _maybe_dump_debug_html(record, html, debug_dir, dump_count or [0])
+        return record
     except Exception as e:
-        log(f"    Could not load job page for verification: {e}")
-        return "", False
+        log(f"    Could not load job page: {e}")
+        return record
 
 
-def get_page_text_requests(url: str, engine: str, log):
-    """Returns (text, used_fallback)."""
+def _accept_cookie_consent(page):
+    """Best-effort click of a cookie/consent accept button, since some sites
+    withhold real content behind the banner until it's dismissed."""
+    for sel in ["#onetrust-accept-btn-handler", 'button[aria-label*="Accept" i]',
+                'button[aria-label*="Akzeptieren" i]', 'button:has-text("Accept all")',
+                'button:has-text("Alle akzeptieren")']:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=500):
+                btn.click(timeout=1000)
+                page.wait_for_timeout(300)
+                return
+        except Exception:
+            pass
+
+
+def fetch_details_requests(url: str, engine: str, log) -> dict:
+    """Loads a job page with plain HTTP and returns a record dict (see _empty_record)."""
+    record = _empty_record(url)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        return extract_main_text(soup, engine)
+        return _fill_record(record, resp.text, engine)
     except Exception as e:
-        log(f"    Could not load job page for verification: {e}")
-        return "", False
+        log(f"    Could not load job page: {e}")
+        return record
 
 
-def search_indeed(query: str, days: int, domain: str, context, log) -> list:
-    """Uses a real headless browser (Playwright) since Indeed blocks plain HTTP requests (403)."""
-    urls = []
+def write_markdown(path: str, engine: str, query: str, region: str, records: list):
+    """Writes the saved posting text as one Markdown file, so it can be uploaded to an AI
+    directly instead of asking it to open URLs it isn't allowed to read."""
+    lines = [f"# {engine} results for '{query}' ({region}) - {len(records)} posting(s)", ""]
+    for i, r in enumerate(records, 1):
+        lines.append(f"## {i}. {r['title'] or '(no title found)'}")
+        lines.append(f"- Company: {r['company'] or 'n/a'}")
+        lines.append(f"- Location: {r['location'] or 'n/a'}")
+        lines.append(f"- URL: {r['url']}")
+        desc = r["description"]
+        if r.get("preview_only"):
+            lines.append("- NOTE: preview only - Indeed blocks full descriptions for automated "
+                          "tools; open the URL in your browser for the full text")
+        elif not r["ok"]:
+            lines.append("- NOTE: page could not be read (likely blocked); text below may be missing or junk")
+        elif r["used_fallback"]:
+            lines.append("- NOTE: description container not found; text below is whole-page text and may be noisy")
+            desc = desc[:FALLBACK_TEXT_LIMIT]
+        lines += ["", desc or "(no description retrieved)", "", "---", ""]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+INDEED_CARD_SELECTORS = [
+    "div.job_seen_beacon", "div[data-testid=\"slider_item\"]",
+    "td.resultContent", "li > div.cardOutline",
+]
+
+
+def _parse_indeed_card(card, domain: str) -> dict | None:
+    """Extracts url/title/company/location/snippet from one Indeed search-result
+    card, so keyword filtering and the saved .md can use the preview text that's
+    already on the search page - the detail pages (/viewjob) are behind a login
+    wall for automated traffic and can't be read this way."""
+    a = card.find("a", href=True)
+    if not a:
+        return None
+    href = a["href"]
+    if href.startswith("/"):
+        href = f"https://{domain}" + href
+    m = re.search(r"jk=([0-9a-fA-F]+)", href)
+    if not m:
+        return None
+    url = f"https://{domain}/viewjob?jk={m.group(1)}"
+
+    title = _first_text(card, ["h2.jobTitle span[title]", "h2.jobTitle", "a.jcs-JobTitle span",
+                                "[data-testid=\"jobTitle\"]"])
+    company = _first_text(card, ["span.companyName", "[data-testid=\"company-name\"]"])
+    location = _first_text(card, ["div.companyLocation", "[data-testid=\"text-location\"]"])
+
+    snippet_items = card.select("div.job-snippet ul li, [data-testid=\"jobsnippet_footer\"] ul li, ul.underShelfFooter li")
+    snippet = " ".join(li.get_text(" ", strip=True) for li in snippet_items) if snippet_items else \
+        _first_text(card, ["div.job-snippet", "[data-testid=\"jobsnippet_footer\"]"])
+
+    return {"url": url, "title": title, "company": company, "location": location, "snippet": snippet}
+
+
+def search_indeed(query: str, days: int, domain: str, context, log, debug_dir=None) -> list:
+    """Uses a real headless browser (Playwright) since Indeed blocks plain HTTP requests (403).
+    Returns a list of card dicts (see _parse_indeed_card) rather than bare URLs, since Indeed's
+    job detail pages (/viewjob) are behind a login wall for this kind of automated traffic - the
+    snippet on the search results page is the only description text we can reliably get."""
+    cards_out = []
     seen = set()
     start = 0
     page = context.new_page()
+    dumped_search_page = False
     try:
         while True:
             search_url = f"https://{domain}/jobs?q={quote_plus(query)}&fromage={days}&start={start}"
             page.goto(search_url, timeout=30000)
             page.wait_for_timeout(1500)
-            soup = BeautifulSoup(page.content(), "html.parser")
+            html = page.content()
+            if debug_dir and not dumped_search_page:
+                os.makedirs(debug_dir, exist_ok=True)
+                with open(os.path.join(debug_dir, "search_page.html"), "w", encoding="utf-8") as f:
+                    f.write(html)
+                dumped_search_page = True
+            soup = BeautifulSoup(html, "html.parser")
 
-            new_links = []
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if "/rc/clk" in href or "/viewjob" in href or "jk=" in href:
-                    if href.startswith("/"):
-                        href = f"https://{domain}" + href
-                    href = href.split("&")[0]
-                    if href not in seen:
-                        seen.add(href)
-                        new_links.append(href)
+            found_any_card = False
+            new_cards = []
+            for sel in INDEED_CARD_SELECTORS:
+                card_els = soup.select(sel)
+                if card_els:
+                    found_any_card = True
+                    for card in card_els:
+                        parsed = _parse_indeed_card(card, domain)
+                        if parsed and parsed["url"] not in seen:
+                            seen.add(parsed["url"])
+                            new_cards.append(parsed)
+                    break
 
-            if not new_links:
+            if not found_any_card:
+                # Selectors didn't match this layout - fall back to raw link scanning
+                # so we at least still collect URLs (with no title/company/snippet).
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if "/rc/clk" in href or "/viewjob" in href or "jk=" in href:
+                        if href.startswith("/"):
+                            href = f"https://{domain}" + href
+                        m = re.search(r"jk=([0-9a-fA-F]+)", href)
+                        url = f"https://{domain}/viewjob?jk={m.group(1)}" if m else href.split("&")[0]
+                        if url not in seen:
+                            seen.add(url)
+                            new_cards.append({"url": url, "title": "", "company": "", "location": "", "snippet": ""})
+
+            if not new_cards:
                 break
-            urls.extend(new_links)
+            cards_out.extend(new_cards)
 
             start += RESULTS_PER_PAGE
             time.sleep(random.uniform(2.0, 4.0))
@@ -228,7 +512,7 @@ def search_indeed(query: str, days: int, domain: str, context, log) -> list:
         log(f"  [Indeed] Error for '{query}': {e}")
     finally:
         page.close()
-    return sorted(urls)
+    return sorted(cards_out, key=lambda c: c["url"])
 
 
 def _posted_days_ago(card):
@@ -379,6 +663,13 @@ class JobSearchApp:
         ).grid(row=row, column=0, columnspan=2, sticky="w", pady=3)
 
         row += 1
+        self.save_text_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frm, text="Save posting text to .md file (so an AI can read it without opening URLs)",
+            variable=self.save_text_var
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=3)
+
+        row += 1
         ttk.Label(frm, text="Group 1 (comma-separated):").grid(row=row, column=0, sticky="w", pady=3)
         self.group1_entry = ttk.Entry(frm, width=50)
         self.group1_entry.insert(0, DEFAULT_GROUP1)
@@ -418,7 +709,7 @@ class JobSearchApp:
         self.linkedin_btn.configure(state=state)
 
     def _gather_common_inputs(self):
-        """Returns (queries, days, region, apply_filter, group1, group2, broad_match) or None if invalid."""
+        """Returns (queries, days, region, apply_filter, group1, group2, broad_match, save_text) or None if invalid."""
         queries = [e.get().strip() for e in self.query_entries]
         queries = [q for q in queries if q]
         if not queries:
@@ -437,6 +728,7 @@ class JobSearchApp:
         region = self.region_combo.get() or "Germany"
         apply_filter = self.filter_var.get()
         broad_match = self.broad_match_var.get()
+        save_text = self.save_text_var.get()
         group1 = parse_keywords(self.group1_entry.get())
         group2 = parse_keywords(self.group2_entry.get())
         if apply_filter and (not group1 or not group2):
@@ -446,7 +738,7 @@ class JobSearchApp:
             )
             apply_filter = False
 
-        return queries, days, region, apply_filter, group1, group2, broad_match
+        return queries, days, region, apply_filter, group1, group2, broad_match, save_text
 
     def on_run_indeed(self):
         inputs = self._gather_common_inputs()
@@ -462,7 +754,114 @@ class JobSearchApp:
         self.set_buttons_enabled(False)
         threading.Thread(target=self.run_linkedin_search, args=inputs, daemon=True).start()
 
-    def run_indeed_search(self, queries, days, region, apply_filter, group1, group2, broad_match):
+    def _process_listings(self, urls, fetch, apply_filter, save_text, group1, group2, broad_match):
+        """Fetches each posting (only if filtering or saving text) and returns
+        (kept_urls, records, all_records). `fetch` is a callable url -> record dict.
+        all_records is every fetched record regardless of keyword filter, so blocked/
+        fallback pages can still be written to .md for inspection even when 0 pass
+        the filter."""
+        if not (apply_filter or save_text):
+            return urls, [], []
+        self.log_msg(f"    Fetching {len(urls)} posting(s)...")
+        kept, records, all_records = [], [], []
+        fallback_count = blocked_count = failed_count = 0
+        for u in urls:
+            rec = fetch(u)
+            all_records.append(rec)
+            if rec["blocked"]:
+                blocked_count += 1
+            elif not rec["ok"]:
+                failed_count += 1
+            elif rec["used_fallback"]:
+                fallback_count += 1
+            text = " ".join(f"{rec['title']} {rec['description']}".split())
+            if not apply_filter or keyword_groups_match(text, group1, group2, broad_match):
+                kept.append(u)
+                records.append(rec)
+            time.sleep(random.uniform(1.0, 2.0))
+        if apply_filter:
+            self.log_msg(f"    Keyword filter: kept {len(kept)}/{len(urls)}.")
+        if blocked_count:
+            self.log_msg(
+                f"    Note: {blocked_count} page(s) hit a bot-check/consent wall instead of "
+                "the real posting - see debug_*.html in the results folder."
+            )
+        if fallback_count:
+            self.log_msg(
+                f"    Note: {fallback_count} page(s) used whole-page text "
+                "(description container not found) - may be less precise."
+            )
+        if failed_count:
+            self.log_msg(f"    Note: {failed_count} page(s) could not be read (failed to load).")
+        return kept, records, all_records
+
+    def _process_indeed_cards(self, cards, apply_filter, save_text, group1, group2, broad_match,
+                               page=None, domain=None, query=None, days=None, debug_dir=None):
+        """Builds a record per Indeed card (title/company/location from the search page) and,
+        when page/domain/query/days are given, tries to fetch each job's FULL description via
+        the &vjk= search-page embed (see fetch_indeed_description_via_search) rather than the
+        blocked /viewjob endpoint. Falls back to the card's snippet, or just the title, if that
+        fetch comes back empty. Returns (kept_urls, records)."""
+        kept, records = [], []
+        full_fetch = page is not None and (apply_filter or save_text)
+        full_ok_count = full_fail_count = 0
+        dump_count = [0]
+        for c in cards:
+            description, used_full = c["snippet"], False
+            if full_fetch:
+                desc, ok = fetch_indeed_description_via_search(
+                    page, domain, query, days, jk_from_url(c["url"]), self.log_msg, debug_dir, dump_count)
+                time.sleep(random.uniform(1.0, 2.0))
+                if ok:
+                    description, used_full = desc, True
+                    full_ok_count += 1
+                else:
+                    full_fail_count += 1
+
+            text = " ".join(f"{c['title']} {description}".split())
+            if not apply_filter or keyword_groups_match(text, group1, group2, broad_match):
+                kept.append(c["url"])
+                records.append({
+                    "url": c["url"], "title": c["title"], "company": c["company"],
+                    "location": c["location"],
+                    "description": description or "(no description text found)",
+                    "used_fallback": False, "blocked": False,
+                    "ok": bool(c["title"] or description),
+                    "preview_only": not used_full,
+                })
+        if apply_filter:
+            self.log_msg(f"    Keyword filter: kept {len(kept)}/{len(cards)}.")
+        if full_fetch:
+            self.log_msg(f"    Full descriptions: got {full_ok_count}/{len(cards)} via search-page embed.")
+            if full_fail_count:
+                self.log_msg(
+                    f"    Note: {full_fail_count} job(s) had no embedded description "
+                    "(falling back to preview snippet/title) - see debug_*.html."
+                )
+        empty_count = sum(1 for c in cards if not c["title"] and not c["snippet"])
+        if empty_count:
+            self.log_msg(
+                f"    Note: {empty_count}/{len(cards)} card(s) had no title/snippet text - "
+                "Indeed's search page layout may have changed; see debug/search_page.html."
+            )
+        return kept, records
+
+    def _save_results(self, folder, engine, query, region, urls, records, all_records):
+        safe_name = sanitize(query)
+        path = os.path.join(folder, f"results_{safe_name}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(urls))
+        self.log_msg(f"    {len(urls)} URL(s) -> {path}")
+        # Prefer the kept (filtered) records; if the filter kept nothing but pages
+        # were still fetched, write those instead so blocked/fallback pages are
+        # visible rather than silently producing no .md at all.
+        to_write = records or all_records
+        if to_write:
+            md_path = os.path.join(folder, f"results_{safe_name}.md")
+            write_markdown(md_path, engine, query, region, to_write)
+            self.log_msg(f"    Posting text -> {md_path}")
+
+    def run_indeed_search(self, queries, days, region, apply_filter, group1, group2, broad_match, save_text):
         domain = COUNTRIES[region]["indeed_domain"]
         locale = COUNTRIES[region]["locale"]
         timezone_id = COUNTRIES[region]["timezone"]
@@ -479,38 +878,19 @@ class JobSearchApp:
                     timezone_id=timezone_id,
                     viewport={"width": 1366, "height": 768},
                 )
-                detail_page = context.new_page()
-
                 for query in queries:
-                    safe_name = sanitize(query)
                     self.log_msg(f"  Searching '{query}'...")
-                    urls = search_indeed(query, days, domain, context, self.log_msg)
+                    debug_dir = os.path.join(folder, f"debug_{sanitize(query)}")
+                    cards = search_indeed(query, days, domain, context, self.log_msg, debug_dir)
+                    self.log_msg(f"    Found {len(cards)} posting(s).")
+                    # Fetching full descriptions per job (via /viewjob or the &vjk= search embed)
+                    # reliably triggers a Cloudflare Turnstile CAPTCHA after a handful of requests -
+                    # not a fixable-by-this-script problem. Sticking to what the search page itself
+                    # gives us: title/company/location/URL, filtered on title text only.
+                    urls, records = self._process_indeed_cards(
+                        cards, apply_filter, save_text, group1, group2, broad_match)
+                    self._save_results(folder, "Indeed", query, region, urls, records, [])
 
-                    if apply_filter:
-                        self.log_msg(f"    Verifying keyword match on {len(urls)} listing(s)...")
-                        kept = []
-                        fallback_count = 0
-                        for u in urls:
-                            text, used_fallback = get_page_text_playwright(detail_page, u, "indeed", self.log_msg)
-                            if used_fallback:
-                                fallback_count += 1
-                            if keyword_groups_match(text, group1, group2, broad_match):
-                                kept.append(u)
-                            time.sleep(random.uniform(1.0, 2.0))
-                        self.log_msg(f"    Keyword filter: kept {len(kept)}/{len(urls)}.")
-                        if fallback_count:
-                            self.log_msg(
-                                f"    Note: {fallback_count} page(s) used whole-page text "
-                                "(description container not found) — may be less precise."
-                            )
-                        urls = kept
-
-                    path = os.path.join(folder, f"results_{safe_name}.txt")
-                    with open(path, "w", encoding="utf-8") as f:
-                        f.write("\n".join(urls))
-                    self.log_msg(f"    {len(urls)} URL(s) -> {path}")
-
-                detail_page.close()
                 context.close()
                 browser.close()
             self.log_msg("\nDone.")
@@ -520,44 +900,26 @@ class JobSearchApp:
         finally:
             self.root.after(0, lambda: self.set_buttons_enabled(True))
 
-    def run_linkedin_search(self, queries, days, region, apply_filter, group1, group2, broad_match):
+    def run_linkedin_search(self, queries, days, region, apply_filter, group1, group2, broad_match, save_text):
         geo_id = COUNTRIES[region]["linkedin_geo"]
         date_str = datetime.now().strftime("%y%m%d")
 
         folder = get_output_folder(date_str, "LinkedIn", region)
         self.log_msg(f"LinkedIn folder: {folder}")
 
-        for query in queries:
-            safe_name = sanitize(query)
-            self.log_msg(f"  Searching '{query}'...")
-            urls = search_linkedin(query, days, geo_id, self.log_msg)
-
-            if apply_filter:
-                self.log_msg(f"    Verifying keyword match on {len(urls)} listing(s)...")
-                kept = []
-                fallback_count = 0
-                for u in urls:
-                    text, used_fallback = get_page_text_requests(u, "linkedin", self.log_msg)
-                    if used_fallback:
-                        fallback_count += 1
-                    if keyword_groups_match(text, group1, group2, broad_match):
-                        kept.append(u)
-                    time.sleep(random.uniform(1.0, 2.0))
-                self.log_msg(f"    Keyword filter: kept {len(kept)}/{len(urls)}.")
-                if fallback_count:
-                    self.log_msg(
-                        f"    Note: {fallback_count} page(s) used whole-page text "
-                        "(description container not found) — may be less precise."
-                    )
-                urls = kept
-
-            path = os.path.join(folder, f"results_{safe_name}.txt")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("\n".join(urls))
-            self.log_msg(f"    {len(urls)} URL(s) -> {path}")
-
-        self.log_msg("\nDone.")
-        self.root.after(0, lambda: self.set_buttons_enabled(True))
+        try:
+            for query in queries:
+                self.log_msg(f"  Searching '{query}'...")
+                urls = search_linkedin(query, days, geo_id, self.log_msg)
+                urls, records, all_records = self._process_listings(
+                    urls,
+                    lambda u: fetch_details_requests(u, "linkedin", self.log_msg),
+                    apply_filter, save_text, group1, group2, broad_match,
+                )
+                self._save_results(folder, "LinkedIn", query, region, urls, records, all_records)
+            self.log_msg("\nDone.")
+        finally:
+            self.root.after(0, lambda: self.set_buttons_enabled(True))
 
 
 if __name__ == "__main__":
