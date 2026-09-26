@@ -60,7 +60,7 @@ import time
 import random
 import threading
 from datetime import datetime, timezone
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, quote
 
 RESULTS_PER_PAGE = 10   # Indeed's pagination step
 PAGE_SAFETY_CAP = 300   # stop after ~20 pages even if more exist
@@ -97,6 +97,14 @@ COUNTRIES = {
     "Japan":          {"indeed_domain": "jp.indeed.com",  "linkedin_geo": "101355337", "locale": "ja-JP", "timezone": "Asia/Tokyo"},
     "Taiwan":         {"indeed_domain": "tw.indeed.com",  "linkedin_geo": "104187078", "locale": "zh-TW", "timezone": "Asia/Taipei"},
 }
+
+
+# Stepstone (stepstone.de) only lists jobs in Germany - there's no country
+# selector on the site itself (stepstone.at/.be/.nl are separate sites this
+# script doesn't target), so unlike Indeed/LinkedIn there's no per-region
+# domain map: every Stepstone search always goes to www.stepstone.de.
+STEPSTONE_DOMAIN = "www.stepstone.de"
+STEPSTONE_REGION_LABEL = "Germany"
 
 
 def sanitize(query: str) -> str:
@@ -267,6 +275,14 @@ def extract_job_details(soup: BeautifulSoup, engine: str) -> dict:
         container = soup.find("div", class_=lambda c: c and "show-more-less-html__markup" in c)
         if not container:
             container = soup.find("div", class_=lambda c: c and "description__text" in c)
+    elif engine == "stepstone":
+        # Best-effort selectors (exact markup wasn't hand-verified) - falls
+        # through to whole-page text (used_fallback=True) if none match.
+        company = _first_text(soup, ['a[href*="/cmp/"]', '[data-at="metadata-company-name"]'])
+        location = _first_text(soup, ['[data-at="metadata-location"]'])
+        container = soup.find(attrs={"data-at": "job-ad-content"})
+        if not container:
+            container = soup.find("div", class_=lambda c: c and "job-ad-display" in c)
 
     if container:
         description, used_fallback = _block_text(container), False
@@ -404,8 +420,8 @@ def write_markdown(path: str, engine: str, query: str, region: str, records: lis
         lines.append(f"- URL: {r['url']}")
         desc = r["description"]
         if r.get("preview_only"):
-            lines.append("- NOTE: preview only - Indeed blocks full descriptions for automated "
-                          "tools; open the URL in your browser for the full text")
+            lines.append(f"- NOTE: preview only - {engine} blocked/stalled full description fetches "
+                          "for automated tools; open the URL in your browser for the full text")
         elif not r["ok"]:
             lines.append("- NOTE: page could not be read (likely blocked); text below may be missing or junk")
         elif r["used_fallback"]:
@@ -613,10 +629,196 @@ def search_linkedin(query: str, days: int, geo_id: str, log) -> list:
     return sorted(urls)
 
 
+def slugify_stepstone_query(query: str) -> str:
+    """Stepstone's search URLs take the keyword as a hyphenated path segment,
+    e.g. 'python engineer' -> 'python-engineer'. quote() with safe='-' handles
+    umlauts/special characters the same way Stepstone's own links do."""
+    slug = re.sub(r"\s+", "-", query.strip().lower())
+    return quote(slug, safe="-")
+
+
+STEPSTONE_POSTED_MARKERS = [
+    (r"\bneu\b", 0), (r"\bheute\b", 0), (r"\bgestern\b", 1),
+]
+
+
+def _stepstone_days_ago(text: str):
+    """Parses Stepstone's German relative-date text ('vor 3 Tagen', 'vor 2
+    Wochen', 'NEU', 'heute', 'gestern') into an integer day count. Returns
+    None if no recognizable pattern is found, so callers can keep undated
+    listings rather than silently dropping them (same approach as LinkedIn's
+    _posted_days_ago)."""
+    if not text:
+        return None
+    t = text.strip().lower()
+    for pattern, value in STEPSTONE_POSTED_MARKERS:
+        if re.search(pattern, t):
+            return value
+    m = re.search(r"vor\s+(\d+)\s*(stunde|tag|woche|monat)", t)
+    if not m:
+        return None
+    value, unit = int(m.group(1)), m.group(2)
+    return {"stunde": 0, "tag": value, "woche": value * 7, "monat": value * 30}.get(unit)
+
+
+STEPSTONE_JOB_URL_RE = re.compile(r"/stellenangebote--.*-\d+-inline\.html")
+
+
+def _parse_stepstone_card(a, log=None) -> dict:
+    """Builds a card dict from a job-title anchor on the Stepstone search
+    results page. Selectors below are taken from a real search_page.html dump
+    (article[data-testid="job-item"] cards, data-at="job-item-title" /
+    "job-item-company-name" / "job-item-location" / "jobcard-content" /
+    "job-item-timeago"), not guessed - if Stepstone changes its markup these
+    are the fields to re-check against a fresh debug dump."""
+    href = a["href"]
+    if href.startswith("/"):
+        href = f"https://{STEPSTONE_DOMAIN}" + href
+    url = href.split("?")[0]
+    title = a.get_text(" ", strip=True)
+
+    container = a.find_parent("article", attrs={"data-testid": "job-item"}) \
+        or a.find_parent(["article", "li", "div"])
+    company = location = snippet = posted_text = ""
+    if container is not None:
+        comp_el = container.find(attrs={"data-at": "job-item-company-name"})
+        if comp_el:
+            company = comp_el.get_text(" ", strip=True)
+        loc_el = container.find(attrs={"data-at": "job-item-location"})
+        if loc_el:
+            location = loc_el.get_text(" ", strip=True)
+        snippet_el = container.find(attrs={"data-at": "jobcard-content"})
+        if snippet_el:
+            snippet = snippet_el.get_text(" ", strip=True)
+        time_el = container.find(attrs={"data-at": "job-item-timeago"})
+        if time_el:
+            posted_text = time_el.get_text(" ", strip=True)
+
+    return {
+        "url": url, "title": title, "company": company, "location": location,
+        "snippet": snippet, "posted_text": posted_text,
+    }
+
+
+def search_stepstone(query: str, days: int, log, debug_dir=None, max_pages: int = 20) -> list:
+    """Paginates Stepstone's (Germany-only) search results via plain HTTP,
+    the same lightweight approach used for LinkedIn. Stepstone's site only
+    exposes two server-side date facets (last 24h / last 7 days), so for a
+    requested range beyond 7 days this fetches unfiltered and applies the
+    days cutoff client-side using each card's own 'vor X Tage' text (same
+    idea as LinkedIn's posted-date filtering)."""
+    slug = slugify_stepstone_query(query)
+    base_url = f"https://{STEPSTONE_DOMAIN}/jobs/{slug}"
+    age_param = "&ag=age_1" if days <= 1 else ("&ag=age_7" if days <= 7 else "")
+
+    cards_out, seen = [], set()
+    skipped_old = undated = 0
+    dumped = False
+
+    for page_num in range(1, max_pages + 1):
+        if page_num > 1:
+            url = f"{base_url}?page={page_num}{age_param}"
+        elif age_param:
+            url = f"{base_url}?{age_param.lstrip('&')}"
+        else:
+            url = base_url
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+        except Exception as e:
+            log(f"  [Stepstone] Error for '{query}' at page {page_num}: {e}")
+            break
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        if debug_dir and not dumped:
+            os.makedirs(debug_dir, exist_ok=True)
+            with open(os.path.join(debug_dir, "search_page.html"), "w", encoding="utf-8") as f:
+                f.write(resp.text)
+            dumped = True
+
+        anchors = [a for a in soup.find_all("a", href=True) if STEPSTONE_JOB_URL_RE.search(a["href"])]
+        new_count = 0
+        for a in anchors:
+            card = _parse_stepstone_card(a, log)
+            if card["url"] in seen:
+                continue
+            seen.add(card["url"])
+
+            days_ago = _stepstone_days_ago(card["posted_text"])
+            if days_ago is None:
+                undated += 1
+            elif days_ago > days:
+                skipped_old += 1
+                continue
+
+            cards_out.append(card)
+            new_count += 1
+
+        if new_count == 0:
+            break
+        time.sleep(random.uniform(1.5, 3.0))
+
+    if skipped_old:
+        log(f"  [Stepstone] Filtered out {skipped_old} listing(s) older than {days} day(s).")
+    if undated:
+        log(f"  [Stepstone] {undated} listing(s) had no readable post date and were kept.")
+    return sorted(cards_out, key=lambda c: c["url"])
+
+
+def fetch_stepstone_description_playwright(page, url: str, log, debug_dir=None, dump_count=None,
+                                            referer=None) -> dict:
+    """Loads a Stepstone job detail page in a real headless browser instead of
+    plain requests, since plain HTTP requests to these pages have been
+    observed to consistently hang/fail. Untested whether this actually gets
+    past whatever is blocking them - if it also stalls or the description
+    container never shows up, the caller's circuit breaker in
+    _process_stepstone_cards falls back to the search-page preview, same as
+    the plain-requests path."""
+    record = _empty_record(url)
+    try:
+        if referer:
+            page.goto(url, timeout=15000, referer=referer)
+        else:
+            page.goto(url, timeout=15000)
+        _accept_cookie_consent(page)
+        try:
+            page.wait_for_selector('[data-at="job-ad-content"]', timeout=4000)
+        except Exception:
+            pass  # container never showed up - fall through, extraction will flag it
+        page.wait_for_timeout(500)
+        html = page.content()
+        _fill_record(record, html, "stepstone")
+        _maybe_dump_debug_html(record, html, debug_dir, dump_count or [0])
+        return record
+    except Exception as e:
+        log(f"    Could not load job page: {e}")
+        return record
+
+
+def fetch_stepstone_description(url: str, log) -> dict:
+    """Loads a Stepstone job detail page with plain HTTP. Uses a shorter
+    timeout than the search-page fetch: detail pages have been observed to
+    hang rather than fail fast when blocked, and _process_stepstone_cards
+    trips a circuit breaker after 3 consecutive failures, so a long timeout
+    here means a long stall before that breaker even has a chance to kick in.
+    The description container's exact selector is a best-effort guess (a
+    handful of likely candidates); if none match, falls back to whole-page
+    text like the Indeed/LinkedIn paths do, flagged via used_fallback so it's
+    visible in the saved .md output."""
+    record = _empty_record(url)
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=8)
+        resp.raise_for_status()
+        return _fill_record(record, resp.text, "stepstone")
+    except Exception as e:
+        log(f"    Could not load job page: {e}")
+        return record
+
+
 class JobSearchApp:
     def __init__(self, root):
         self.root = root
-        root.title("Job Search Tool - Indeed & LinkedIn")
+        root.title("Job Search Tool - Indeed, LinkedIn & Stepstone")
         root.geometry("680x700")
 
         frm = ttk.Frame(root, padding=12)
@@ -688,6 +890,8 @@ class JobSearchApp:
         self.indeed_btn.pack(side="left", padx=6)
         self.linkedin_btn = ttk.Button(btn_frame, text="Run LinkedIn Search", command=self.on_run_linkedin)
         self.linkedin_btn.pack(side="left", padx=6)
+        self.stepstone_btn = ttk.Button(btn_frame, text="Run Stepstone Search", command=self.on_run_stepstone)
+        self.stepstone_btn.pack(side="left", padx=6)
 
         row += 1
         self.log = scrolledtext.ScrolledText(frm, width=76, height=18, state="disabled")
@@ -707,6 +911,7 @@ class JobSearchApp:
         state = "normal" if enabled else "disabled"
         self.indeed_btn.configure(state=state)
         self.linkedin_btn.configure(state=state)
+        self.stepstone_btn.configure(state=state)
 
     def _gather_common_inputs(self):
         """Returns (queries, days, region, apply_filter, group1, group2, broad_match, save_text) or None if invalid."""
@@ -753,6 +958,19 @@ class JobSearchApp:
             return
         self.set_buttons_enabled(False)
         threading.Thread(target=self.run_linkedin_search, args=inputs, daemon=True).start()
+
+    def on_run_stepstone(self):
+        inputs = self._gather_common_inputs()
+        if inputs is None:
+            return
+        region = inputs[2]
+        if region != STEPSTONE_REGION_LABEL:
+            self.log_msg(
+                f"Note: Stepstone only lists jobs in Germany - using Germany "
+                f"instead of the selected region ({region})."
+            )
+        self.set_buttons_enabled(False)
+        threading.Thread(target=self.run_stepstone_search, args=inputs, daemon=True).start()
 
     def _process_listings(self, urls, fetch, apply_filter, save_text, group1, group2, broad_match):
         """Fetches each posting (only if filtering or saving text) and returns
@@ -860,6 +1078,95 @@ class JobSearchApp:
             md_path = os.path.join(folder, f"results_{safe_name}.md")
             write_markdown(md_path, engine, query, region, to_write)
             self.log_msg(f"    Posting text -> {md_path}")
+
+    def _process_stepstone_cards(self, cards, apply_filter, save_text, group1, group2, broad_match, fetch_fn):
+        """Builds a record per Stepstone card (title/company/location/snippet
+        already pulled from the search page) and, when filtering or saving
+        text is needed, also tries fetching each job's own detail page for
+        the full description via fetch_fn(url) -> record dict (either the
+        plain-requests or the Playwright fetcher). Stepstone's detail pages
+        can be blocked/stalled wholesale rather than failing per-job, so
+        after a few consecutive failures this stops attempting further detail
+        fetches and falls back to the search-page snippet for the rest,
+        flagged as preview_only (same idea as the Indeed preview fallback).
+        Returns (kept_urls, records)."""
+        kept, records = [], []
+        full_fetch = apply_filter or save_text
+        consecutive_fails = 0
+        breaker_tripped = False
+        full_ok_count = full_fail_count = 0
+        for c in cards:
+            description, used_full = c["snippet"], False
+            if full_fetch and not breaker_tripped:
+                full = fetch_fn(c["url"])
+                if full["ok"] and full["description"]:
+                    description, used_full = full["description"], True
+                    full_ok_count += 1
+                    consecutive_fails = 0
+                else:
+                    full_fail_count += 1
+                    consecutive_fails += 1
+                    if consecutive_fails >= 3:
+                        breaker_tripped = True
+                        self.log_msg(
+                            "    Note: Stepstone's job pages timed out/failed 3 times in a "
+                            "row - switching to search-page previews for the rest of this "
+                            "query instead of retrying every remaining job individually."
+                        )
+                time.sleep(random.uniform(1.0, 2.0))
+
+            text = " ".join(f"{c['title']} {description}".split())
+            if not apply_filter or keyword_groups_match(text, group1, group2, broad_match):
+                kept.append(c["url"])
+                records.append({
+                    "url": c["url"], "title": c["title"] or "(no title found)",
+                    "company": c["company"], "location": c["location"],
+                    "description": description or "(no description text found)",
+                    "used_fallback": False, "blocked": False,
+                    "ok": bool(c["title"] or description),
+                    "preview_only": not used_full,
+                })
+        if apply_filter:
+            self.log_msg(f"    Keyword filter: kept {len(kept)}/{len(cards)}.")
+        if full_fetch:
+            self.log_msg(f"    Full descriptions: got {full_ok_count}/{len(cards)} from job pages "
+                         f"({full_fail_count} failed/skipped - preview snippet used instead).")
+        return kept, records
+
+    def run_stepstone_search(self, queries, days, region, apply_filter, group1, group2, broad_match, save_text):
+        date_str = datetime.now().strftime("%y%m%d")
+        folder = get_output_folder(date_str, "Stepstone", STEPSTONE_REGION_LABEL)
+        self.log_msg(f"Stepstone folder: {folder}")
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(
+                    user_agent=HEADERS["User-Agent"],
+                    locale="de-DE",
+                    timezone_id="Europe/Berlin",
+                    viewport={"width": 1366, "height": 768},
+                )
+                page = context.new_page()
+                for query in queries:
+                    self.log_msg(f"  Searching '{query}'...")
+                    debug_dir = os.path.join(folder, f"debug_{sanitize(query)}")
+                    cards = search_stepstone(query, days, self.log_msg, debug_dir)
+                    self.log_msg(f"    Found {len(cards)} posting(s).")
+                    search_url = f"https://{STEPSTONE_DOMAIN}/jobs/{slugify_stepstone_query(query)}"
+                    dump_count = [0]
+                    fetch_fn = lambda u: fetch_stepstone_description_playwright(
+                        page, u, self.log_msg, debug_dir, dump_count, referer=search_url)
+                    urls, records = self._process_stepstone_cards(
+                        cards, apply_filter, save_text, group1, group2, broad_match, fetch_fn)
+                    self._save_results(folder, "Stepstone", query, STEPSTONE_REGION_LABEL, urls, records, [])
+                context.close()
+                browser.close()
+            self.log_msg("\nDone.")
+        except Exception as e:
+            self.log_msg(f"  [Stepstone] Could not start browser: {e}")
+            self.log_msg("  See README.md 'Fixing a Windows .exe build' if this happened from the .exe.")
+        finally:
+            self.root.after(0, lambda: self.set_buttons_enabled(True))
 
     def run_indeed_search(self, queries, days, region, apply_filter, group1, group2, broad_match, save_text):
         domain = COUNTRIES[region]["indeed_domain"]
