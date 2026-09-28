@@ -75,8 +75,8 @@ DEFAULT_QUERIES = [
     "brain computer interface",
 ]
 
-DEFAULT_GROUP1 = "engineer, scientist, software, simulation, python, C++, algorithm"
-DEFAULT_GROUP2 = "biomed, medic, clinical, biolog, physio, neural, neuro, biophysic"
+DEFAULT_GROUP1 = "engineer, scientist, software, simulat, python, C++, algor"
+DEFAULT_GROUP2 = "bio, medic, clinic, physio, neur"
 
 HEADERS = {
     "User-Agent": (
