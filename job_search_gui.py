@@ -432,6 +432,45 @@ def write_markdown(path: str, engine: str, query: str, region: str, records: lis
         f.write("\n".join(lines))
 
 
+def write_combined_markdown(path: str, engine: str, region: str, sections: list):
+    """Writes ALL postings of one engine run (every query) into a single Markdown file.
+    `sections` is a list of (query, records) tuples; queries with no records are skipped.
+    Duplicate postings (same URL) appear only once, under the first query that found them."""
+    # Drop postings already listed under an earlier query (same URL, ignoring ?tracking / #fragment).
+    seen, deduped = set(), []
+    for q, recs in sections:
+        unique = []
+        for r in recs:
+            key = r["url"].split("?")[0].split("#")[0].rstrip("/")
+            if key not in seen:
+                seen.add(key)
+                unique.append(r)
+        if unique:
+            deduped.append((q, unique))
+    sections = deduped
+    total = sum(len(recs) for _, recs in sections)
+    lines = [f"# {engine} results ({region}) - {total} posting(s) across {len(sections)} query/queries", ""]
+    for query, records in sections:
+        lines += [f"# Query: '{query}' - {len(records)} posting(s)", ""]
+        for i, r in enumerate(records, 1):
+            lines.append(f"## {i}. {r['title'] or '(no title found)'}")
+            lines.append(f"- Company: {r['company'] or 'n/a'}")
+            lines.append(f"- Location: {r['location'] or 'n/a'}")
+            lines.append(f"- URL: {r['url']}")
+            desc = r["description"]
+            if r.get("preview_only"):
+                lines.append(f"- NOTE: preview only - {engine} blocked/stalled full description fetches "
+                              "for automated tools; open the URL in your browser for the full text")
+            elif not r["ok"]:
+                lines.append("- NOTE: page could not be read (likely blocked); text below may be missing or junk")
+            elif r["used_fallback"]:
+                lines.append("- NOTE: description container not found; text below is whole-page text and may be noisy")
+                desc = desc[:FALLBACK_TEXT_LIMIT]
+            lines += ["", desc or "(no description retrieved)", "", "---", ""]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
 INDEED_CARD_SELECTORS = [
     "div.job_seen_beacon", "div[data-testid=\"slider_item\"]",
     "td.resultContent", "li > div.cardOutline",
@@ -1078,6 +1117,16 @@ class JobSearchApp:
             md_path = os.path.join(folder, f"results_{safe_name}.md")
             write_markdown(md_path, engine, query, region, to_write)
             self.log_msg(f"    Posting text -> {md_path}")
+        return to_write or []
+
+    def _save_combined(self, folder, engine, region, sections):
+        """Writes one combined .md for the whole engine run in the root (working) directory,
+        named after the results folder, e.g. results_260927_LinkedIn_Germany.md."""
+        if not any(recs for _, recs in sections):
+            return
+        md_path = f"{folder}.md"
+        write_combined_markdown(md_path, engine, region, sections)
+        self.log_msg(f"  All results combined -> {md_path}")
 
     def _process_stepstone_cards(self, cards, apply_filter, save_text, group1, group2, broad_match, fetch_fn):
         """Builds a record per Stepstone card (title/company/location/snippet
@@ -1147,6 +1196,7 @@ class JobSearchApp:
                     viewport={"width": 1366, "height": 768},
                 )
                 page = context.new_page()
+                combined = []
                 for query in queries:
                     self.log_msg(f"  Searching '{query}'...")
                     debug_dir = os.path.join(folder, f"debug_{sanitize(query)}")
@@ -1158,7 +1208,9 @@ class JobSearchApp:
                         page, u, self.log_msg, debug_dir, dump_count, referer=search_url)
                     urls, records = self._process_stepstone_cards(
                         cards, apply_filter, save_text, group1, group2, broad_match, fetch_fn)
-                    self._save_results(folder, "Stepstone", query, STEPSTONE_REGION_LABEL, urls, records, [])
+                    saved = self._save_results(folder, "Stepstone", query, STEPSTONE_REGION_LABEL, urls, records, [])
+                    combined.append((query, saved))
+                self._save_combined(folder, "Stepstone", STEPSTONE_REGION_LABEL, combined)
                 context.close()
                 browser.close()
             self.log_msg("\nDone.")
@@ -1185,6 +1237,7 @@ class JobSearchApp:
                     timezone_id=timezone_id,
                     viewport={"width": 1366, "height": 768},
                 )
+                combined = []
                 for query in queries:
                     self.log_msg(f"  Searching '{query}'...")
                     debug_dir = os.path.join(folder, f"debug_{sanitize(query)}")
@@ -1196,7 +1249,9 @@ class JobSearchApp:
                     # gives us: title/company/location/URL, filtered on title text only.
                     urls, records = self._process_indeed_cards(
                         cards, apply_filter, save_text, group1, group2, broad_match)
-                    self._save_results(folder, "Indeed", query, region, urls, records, [])
+                    saved = self._save_results(folder, "Indeed", query, region, urls, records, [])
+                    combined.append((query, saved))
+                self._save_combined(folder, "Indeed", region, combined)
 
                 context.close()
                 browser.close()
@@ -1215,6 +1270,7 @@ class JobSearchApp:
         self.log_msg(f"LinkedIn folder: {folder}")
 
         try:
+            combined = []
             for query in queries:
                 self.log_msg(f"  Searching '{query}'...")
                 urls = search_linkedin(query, days, geo_id, self.log_msg)
@@ -1223,7 +1279,9 @@ class JobSearchApp:
                     lambda u: fetch_details_requests(u, "linkedin", self.log_msg),
                     apply_filter, save_text, group1, group2, broad_match,
                 )
-                self._save_results(folder, "LinkedIn", query, region, urls, records, all_records)
+                saved = self._save_results(folder, "LinkedIn", query, region, urls, records, all_records)
+                combined.append((query, saved))
+            self._save_combined(folder, "LinkedIn", region, combined)
             self.log_msg("\nDone.")
         finally:
             self.root.after(0, lambda: self.set_buttons_enabled(True))
