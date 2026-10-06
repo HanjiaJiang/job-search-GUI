@@ -117,20 +117,22 @@ def parse_keywords(text: str) -> list:
     return [k.strip() for k in text.split(",") if k.strip()]
 
 
-def get_output_folder(date_str: str, engine: str, region: str) -> str:
-    """Create (and return) results_YYMMDD_Engine_Region, appending _NN if it already exists."""
+def get_output_folder(date_str: str, engine: str, region: str, create: bool = True) -> str:
+    """Returns results_YYMMDD_Engine_Region, appending _NN if that name (as a folder OR as
+    the combined results_..._.md file - see _save_combined) is already taken, so the two
+    stay in step whether or not the folder itself gets created this run. Creates the folder
+    only when `create` is True; when False, the name is reserved but nothing is made on disk
+    until _save_combined writes its one file."""
     region_label = region.replace(" ", "")
     base_name = f"results_{date_str}_{engine}_{region_label}"
-    if not os.path.exists(base_name):
-        os.makedirs(base_name)
-        return base_name
+    name = base_name
     n = 2
-    while True:
-        candidate = f"{base_name}_{n:02d}"
-        if not os.path.exists(candidate):
-            os.makedirs(candidate)
-            return candidate
+    while os.path.exists(name) or os.path.exists(f"{name}.md"):
+        name = f"{base_name}_{n:02d}"
         n += 1
+    if create:
+        os.makedirs(name)
+    return name
 
 
 def contains_keyword(text_lower: str, keyword: str, broad_match: bool = False) -> bool:
@@ -911,6 +913,14 @@ class JobSearchApp:
         ).grid(row=row, column=0, columnspan=2, sticky="w", pady=3)
 
         row += 1
+        self.create_folder_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm, text="Also create results_... folder with per-query .txt/.md files "
+                      "(off = combined .md only)",
+            variable=self.create_folder_var
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=3)
+
+        row += 1
         ttk.Label(frm, text="Group 1 (comma-separated):").grid(row=row, column=0, sticky="w", pady=3)
         self.group1_entry = ttk.Entry(frm, width=50)
         self.group1_entry.insert(0, DEFAULT_GROUP1)
@@ -931,6 +941,8 @@ class JobSearchApp:
         self.linkedin_btn.pack(side="left", padx=6)
         self.stepstone_btn = ttk.Button(btn_frame, text="Run Stepstone Search", command=self.on_run_stepstone)
         self.stepstone_btn.pack(side="left", padx=6)
+        self.save_log_btn = ttk.Button(btn_frame, text="Save Log", command=self.on_save_log)
+        self.save_log_btn.pack(side="left", padx=6)
 
         row += 1
         self.log = scrolledtext.ScrolledText(frm, width=76, height=18, state="disabled")
@@ -946,6 +958,20 @@ class JobSearchApp:
         self.log.configure(state="disabled")
         self.root.update_idletasks()
 
+    def on_save_log(self):
+        """Writes the full contents of the on-screen log to log_YYMMDD.txt in the working
+        directory. Re-clicking later the same day overwrites that file with the log as it
+        now stands, rather than creating a new numbered file each time."""
+        date_str = datetime.now().strftime("%y%m%d")
+        path = f"log_{date_str}.txt"
+        content = self.log.get("1.0", "end-1c")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            self.log_msg(f"Log saved -> {path}")
+        except OSError as e:
+            messagebox.showerror("Save log failed", str(e))
+
     def set_buttons_enabled(self, enabled: bool):
         state = "normal" if enabled else "disabled"
         self.indeed_btn.configure(state=state)
@@ -953,7 +979,8 @@ class JobSearchApp:
         self.stepstone_btn.configure(state=state)
 
     def _gather_common_inputs(self):
-        """Returns (queries, days, region, apply_filter, group1, group2, broad_match, save_text) or None if invalid."""
+        """Returns (queries, days, region, apply_filter, group1, group2, broad_match, save_text,
+        create_folder) or None if invalid."""
         queries = [e.get().strip() for e in self.query_entries]
         queries = [q for q in queries if q]
         if not queries:
@@ -973,6 +1000,7 @@ class JobSearchApp:
         apply_filter = self.filter_var.get()
         broad_match = self.broad_match_var.get()
         save_text = self.save_text_var.get()
+        create_folder = self.create_folder_var.get()
         group1 = parse_keywords(self.group1_entry.get())
         group2 = parse_keywords(self.group2_entry.get())
         if apply_filter and (not group1 or not group2):
@@ -982,7 +1010,7 @@ class JobSearchApp:
             )
             apply_filter = False
 
-        return queries, days, region, apply_filter, group1, group2, broad_match, save_text
+        return queries, days, region, apply_filter, group1, group2, broad_match, save_text, create_folder
 
     def on_run_indeed(self):
         inputs = self._gather_common_inputs()
@@ -1103,16 +1131,19 @@ class JobSearchApp:
             )
         return kept, records
 
-    def _save_results(self, folder, engine, query, region, urls, records, all_records):
+    def _save_results(self, folder, engine, query, region, urls, records, all_records, create_folder=True):
+        # Prefer the kept (filtered) records; if the filter kept nothing but pages
+        # were still fetched, write those instead so blocked/fallback pages are
+        # visible rather than silently producing no .md at all.
+        to_write = records or all_records
+        if not create_folder:
+            self.log_msg(f"    {len(urls)} URL(s), {len(to_write)} posting(s) kept (per-query files off).")
+            return to_write or []
         safe_name = sanitize(query)
         path = os.path.join(folder, f"results_{safe_name}.txt")
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(urls))
         self.log_msg(f"    {len(urls)} URL(s) -> {path}")
-        # Prefer the kept (filtered) records; if the filter kept nothing but pages
-        # were still fetched, write those instead so blocked/fallback pages are
-        # visible rather than silently producing no .md at all.
-        to_write = records or all_records
         if to_write:
             md_path = os.path.join(folder, f"results_{safe_name}.md")
             write_markdown(md_path, engine, query, region, to_write)
@@ -1182,10 +1213,14 @@ class JobSearchApp:
                          f"({full_fail_count} failed/skipped - preview snippet used instead).")
         return kept, records
 
-    def run_stepstone_search(self, queries, days, region, apply_filter, group1, group2, broad_match, save_text):
+    def run_stepstone_search(self, queries, days, region, apply_filter, group1, group2, broad_match,
+                              save_text, create_folder):
         date_str = datetime.now().strftime("%y%m%d")
-        folder = get_output_folder(date_str, "Stepstone", STEPSTONE_REGION_LABEL)
-        self.log_msg(f"Stepstone folder: {folder}")
+        folder = get_output_folder(date_str, "Stepstone", STEPSTONE_REGION_LABEL, create_folder)
+        if create_folder:
+            self.log_msg(f"Stepstone folder: {folder}")
+        else:
+            self.log_msg(f"Stepstone: per-query folder/files off - will write {folder}.md only.")
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
@@ -1199,7 +1234,7 @@ class JobSearchApp:
                 combined = []
                 for query in queries:
                     self.log_msg(f"  Searching '{query}'...")
-                    debug_dir = os.path.join(folder, f"debug_{sanitize(query)}")
+                    debug_dir = os.path.join(folder, f"debug_{sanitize(query)}") if create_folder else None
                     cards = search_stepstone(query, days, self.log_msg, debug_dir)
                     self.log_msg(f"    Found {len(cards)} posting(s).")
                     search_url = f"https://{STEPSTONE_DOMAIN}/jobs/{slugify_stepstone_query(query)}"
@@ -1208,7 +1243,8 @@ class JobSearchApp:
                         page, u, self.log_msg, debug_dir, dump_count, referer=search_url)
                     urls, records = self._process_stepstone_cards(
                         cards, apply_filter, save_text, group1, group2, broad_match, fetch_fn)
-                    saved = self._save_results(folder, "Stepstone", query, STEPSTONE_REGION_LABEL, urls, records, [])
+                    saved = self._save_results(folder, "Stepstone", query, STEPSTONE_REGION_LABEL,
+                                                urls, records, [], create_folder)
                     combined.append((query, saved))
                 self._save_combined(folder, "Stepstone", STEPSTONE_REGION_LABEL, combined)
                 context.close()
@@ -1220,14 +1256,18 @@ class JobSearchApp:
         finally:
             self.root.after(0, lambda: self.set_buttons_enabled(True))
 
-    def run_indeed_search(self, queries, days, region, apply_filter, group1, group2, broad_match, save_text):
+    def run_indeed_search(self, queries, days, region, apply_filter, group1, group2, broad_match,
+                           save_text, create_folder):
         domain = COUNTRIES[region]["indeed_domain"]
         locale = COUNTRIES[region]["locale"]
         timezone_id = COUNTRIES[region]["timezone"]
         date_str = datetime.now().strftime("%y%m%d")
 
-        folder = get_output_folder(date_str, "Indeed", region)
-        self.log_msg(f"Indeed folder: {folder}")
+        folder = get_output_folder(date_str, "Indeed", region, create_folder)
+        if create_folder:
+            self.log_msg(f"Indeed folder: {folder}")
+        else:
+            self.log_msg(f"Indeed: per-query folder/files off - will write {folder}.md only.")
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
@@ -1240,7 +1280,7 @@ class JobSearchApp:
                 combined = []
                 for query in queries:
                     self.log_msg(f"  Searching '{query}'...")
-                    debug_dir = os.path.join(folder, f"debug_{sanitize(query)}")
+                    debug_dir = os.path.join(folder, f"debug_{sanitize(query)}") if create_folder else None
                     cards = search_indeed(query, days, domain, context, self.log_msg, debug_dir)
                     self.log_msg(f"    Found {len(cards)} posting(s).")
                     # Fetching full descriptions per job (via /viewjob or the &vjk= search embed)
@@ -1249,7 +1289,7 @@ class JobSearchApp:
                     # gives us: title/company/location/URL, filtered on title text only.
                     urls, records = self._process_indeed_cards(
                         cards, apply_filter, save_text, group1, group2, broad_match)
-                    saved = self._save_results(folder, "Indeed", query, region, urls, records, [])
+                    saved = self._save_results(folder, "Indeed", query, region, urls, records, [], create_folder)
                     combined.append((query, saved))
                 self._save_combined(folder, "Indeed", region, combined)
 
@@ -1262,12 +1302,16 @@ class JobSearchApp:
         finally:
             self.root.after(0, lambda: self.set_buttons_enabled(True))
 
-    def run_linkedin_search(self, queries, days, region, apply_filter, group1, group2, broad_match, save_text):
+    def run_linkedin_search(self, queries, days, region, apply_filter, group1, group2, broad_match,
+                             save_text, create_folder):
         geo_id = COUNTRIES[region]["linkedin_geo"]
         date_str = datetime.now().strftime("%y%m%d")
 
-        folder = get_output_folder(date_str, "LinkedIn", region)
-        self.log_msg(f"LinkedIn folder: {folder}")
+        folder = get_output_folder(date_str, "LinkedIn", region, create_folder)
+        if create_folder:
+            self.log_msg(f"LinkedIn folder: {folder}")
+        else:
+            self.log_msg(f"LinkedIn: per-query folder/files off - will write {folder}.md only.")
 
         try:
             combined = []
@@ -1279,7 +1323,7 @@ class JobSearchApp:
                     lambda u: fetch_details_requests(u, "linkedin", self.log_msg),
                     apply_filter, save_text, group1, group2, broad_match,
                 )
-                saved = self._save_results(folder, "LinkedIn", query, region, urls, records, all_records)
+                saved = self._save_results(folder, "LinkedIn", query, region, urls, records, all_records, create_folder)
                 combined.append((query, saved))
             self._save_combined(folder, "LinkedIn", region, combined)
             self.log_msg("\nDone.")
