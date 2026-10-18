@@ -40,11 +40,15 @@ import json
 # Pinning PLAYWRIGHT_BROWSERS_PATH to a fixed, persistent, OS-appropriate
 # folder avoids that. This MUST be set before `playwright` is imported, and
 # the same folder must be used when running `playwright install chromium`
-# (see README).
+# (see README). On Windows this is Playwright's own default folder, so no
+# environment variable is needed when installing the browser.
 def _default_playwright_browsers_dir() -> str:
     home = os.path.expanduser("~")
     if sys.platform.startswith("win"):
-        base = os.environ.get("LOCALAPPDATA", home)
+        # Playwright's own default location on Windows (%LOCALAPPDATA%\ms-playwright),
+        # so a plain `playwright install chromium` installs exactly where the .exe looks.
+        return os.path.join(
+            os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local")), "ms-playwright")
     elif sys.platform == "darwin":
         base = os.path.join(home, "Library", "Application Support")
     else:
