@@ -1,4 +1,4 @@
-# Job Search GUI (Indeed & LinkedIn)
+# Job Search GUI (Indeed, LinkedIn, Stepstone)
 
 ## Run on Windows
 1. Install Python 3.9+ from python.org (check "Add to PATH" during install).
@@ -9,9 +9,9 @@
    python job_search_gui.py
    ```
 3. Fill in / edit the five search fields, the date range, the region, and the
-   two keyword groups (or leave the defaults). Click **Run Indeed Search**
-   and/or **Run LinkedIn Search** — they run independently.
-4. Results land in `results_YYMMDD_<Engine>_<Region>` folders next to the script.
+   two keyword groups. Click **Run Indeed Search**, **Run LinkedIn Search**, or **Run Stepstone Search** — they run independently.
+4. Results will be saved in a `results_YYMMDD_<Engine>_<Region>.md` file.
+5. Running log can be saved in a `log_YYMMDD.txt` file by clicking **Save Log**.
 
 ## Turning it into a standalone .exe (optional)
 ```
@@ -21,87 +21,6 @@ pyinstaller --onefile --windowed --collect-all playwright job_search_gui.py
 The .exe appears in `dist/`. `--collect-all playwright` ensures Playwright's
 internal driver files are bundled correctly.
 
-### One-time browser setup (required before the .exe can use Indeed)
-A PyInstaller `--onefile` .exe re-extracts itself to a temporary folder on
-every run, so a browser installed to Playwright's normal cache location can
-end up "invisible" to the .exe. The script pins Playwright's browser folder
-to a fixed, persistent location instead
-(`%LOCALAPPDATA%\JobSearchGUI\pw-browsers`). On each Windows machine that
-will run the .exe, install the browser into that same folder once, from a
-regular Python prompt (not the .exe):
-```
-set PLAYWRIGHT_BROWSERS_PATH=%LOCALAPPDATA%\JobSearchGUI\pw-browsers
-playwright install chromium
-```
-After that, the .exe will find it automatically on every run — no need to
-repeat this unless the folder is deleted or you move to a new machine.
-
-### Fixing a Windows .exe build
-If Indeed still reports "Executable doesn't exist" from the .exe:
-1. Confirm you ran the one-time browser setup above, in that exact folder.
-2. Rebuild with `--collect-all playwright` if you haven't already.
-3. Check `%LOCALAPPDATA%\JobSearchGUI\pw-browsers` actually contains a
-   `chromium_headless_shell-*` (or `chromium-*`) folder — if not, the
-   install step above didn't complete successfully.
-
-## Building a macOS app (no Mac required, via GitHub Actions)
-PyInstaller can't cross-compile — a macOS app must be built *on* macOS. This
-repo includes `.github/workflows/build-macos.yml`, which builds it for you
-on GitHub's own free macOS runners.
-
-1. Push this project to a GitHub repository (create one if you don't have
-   one yet: `git init`, `git add .`, `git commit -m "initial"`, then create
-   a repo on github.com and push).
-2. On GitHub, open the **Actions** tab. The workflow runs automatically on
-   every push to `main`, or click **Build macOS App → Run workflow** to
-   trigger it manually.
-3. When it finishes (a few minutes), open the completed run and download
-   the **JobSearchGUI-macOS** artifact — a zip containing `JobSearchGUI.app`.
-4. On a Mac: unzip it, then **right-click → Open** the first time (macOS
-   blocks unsigned apps from opening via double-click, since this isn't
-   code-signed/notarized — right-click → Open shows an "Open anyway" option).
-
-### One-time browser setup on macOS (required before Indeed works)
-Same underlying issue as the Windows .exe: Playwright's browser must live in
-a fixed, persistent folder, not wherever the app happens to unpack itself.
-On the Mac that will run the app, open Terminal and run once:
-```
-export PLAYWRIGHT_BROWSERS_PATH="$HOME/Library/Application Support/JobSearchGUI/pw-browsers"
-pip install playwright
-playwright install chromium
-```
-(Any Python with `pip` works for this step — it just needs to write to that
-folder; it doesn't need to be the same Python used to build the app.)
-
-
-- Indeed blocks plain HTTP requests (403), so Indeed searches launch a real
-  headless Chromium browser via Playwright — slower than LinkedIn's requests-
-  based search, and it paginates through result pages (capped at ~20 pages)
-  with short delays to avoid tripping rate limits.
-- LinkedIn now paginates through its public "load more" endpoint (capped at
-  the same ~20-page safety limit as Indeed) and filters results locally by
-  each listing's own posted date, since LinkedIn's date-range parameter is
-  not reliably enforced for anonymous requests. The filter reads LinkedIn's
-  machine-readable date first and falls back to its "3 days ago"-style text
-  if that isn't parseable. A listing with no readable date at all is kept
-  rather than guessed at, and the GUI log reports how many were filtered or
-  kept undated.
-- The optional keyword-group filter (on by default) requires a job to match
-  at least one keyword from Group 1 AND at least one from Group 2. By
-  default matching is whole-word (e.g. "neuro" won't match "neurotech");
-  checking "Broad match" switches to plain substring matching instead (e.g.
-  "neuro" then matches "neurotech", "neurological", etc.) — off by default,
-  since it trades precision for recall. It reads only the job title and
-  the actual description container (Indeed's `jobDescriptionText`,
-  LinkedIn's `show-more-less-html__markup`/`description__text`), not the
-  whole page, so sidebar content like "similar jobs" or "people also
-  viewed" can't cause false-positive matches. If a page's structure doesn't
-  match those selectors (site redesign), it falls back to whole-page text
-  and the GUI log flags how many listings used that fallback, so you know
-  when results may be less precise. This means opening every candidate
-  job's own page individually, so it noticeably slows a run and adds extra
-  load on top of the search itself; with hundreds of results, expect a much
-  longer run and a higher chance of temporary blocks. Uncheck it for a
-  faster, looser run.
-- Both sites can still block, rate-limit, or change their page structure at
-  any time; treat this as best-effort, not a guaranteed scraper.
+Note: the .exe still needs Playwright's Chromium on the machine it runs on
+(used by Indeed and Stepstone). If it isn't installed yet, open Command Prompt
+and run `pip install playwright` followed by `playwright install chromium`.
