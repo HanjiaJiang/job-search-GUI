@@ -25,3 +25,7 @@ Note: the .exe still needs Playwright's Chromium on the machine it runs on (used
 ## AI Disclosure
 
 This project was developed with the assistance of an AI agent (Claude). While AI was utilized to accelerate the development process, autocomplete boilerplate code, and assist with initial drafting, core architectures and integrations have been reviewed and tested by human maintainers.
+
+## Disclaimer
+
+This tool is provided for personal, non-commercial use, for example to help you search for jobs more efficiently. It is not affiliated with, endorsed by, or sponsored by Indeed, LinkedIn, or Stepstone; all trademarks belong to their respective owners. These platforms' terms of use may restrict or prohibit automated access to their sites. You are solely responsible for reading and complying with those terms and with any laws that apply to you, and you use this software at your own risk. The authors accept no liability for account restrictions, blocked access, or any other consequences of its use. Please keep request volumes low and do not use the tool to collect or redistribute data at scale.
