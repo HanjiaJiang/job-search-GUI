@@ -18,13 +18,10 @@
 pip install pyinstaller
 pyinstaller --onefile --windowed --collect-all playwright job_search_gui.py
 ```
-The .exe appears in `dist/`. `--collect-all playwright` ensures Playwright's
-internal driver files are bundled correctly.
+The .exe appears in `dist/`. `--collect-all playwright` ensures Playwright's internal driver files are bundled correctly.
 
-Note: the .exe still needs Playwright's Chromium on the machine it runs on
-(used by Indeed and Stepstone). If it isn't installed yet, open Command Prompt
+Note: the .exe still needs Playwright's Chromium on the machine it runs on (used by Indeed and Stepstone). If it isn't installed yet, open Command Prompt and run `pip install playwright` followed by `playwright install chromium`.
 
 ## AI Disclosure
 
 This project was developed with the assistance of an AI agent (Claude). While AI was utilized to accelerate the development process, autocomplete boilerplate code, and assist with initial drafting, core architectures and integrations have been reviewed and tested by human maintainers.
-and run `pip install playwright` followed by `playwright install chromium`.
