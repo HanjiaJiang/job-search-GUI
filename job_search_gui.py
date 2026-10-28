@@ -4,8 +4,8 @@ Job Search GUI - Indeed & LinkedIn
 Searches Indeed and LinkedIn for up to 5 user-defined queries, restricted to a
 date range (days back from today), an optional keyword-group filter verified
 against each job's full posting text, and writes the found job-posting URLs
-to .txt files inside a dated results folder. Optionally also saves each
-posting's text (title, company, location, description) to a .md file per query,
+to .txt files inside a dated results folder. Always also saves each
+posting's text (title, company, location, description) to a .md file,
 since AI tools generally cannot open Indeed/LinkedIn URLs themselves. Indeed and LinkedIn are run
 separately (separate buttons) so one engine's issues don't block the other.
 
@@ -910,13 +910,6 @@ class JobSearchApp:
         ).grid(row=row, column=0, columnspan=2, sticky="w", pady=3)
 
         row += 1
-        self.save_text_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            frm, text="Save posting text to .md file (so an AI can read it without opening URLs)",
-            variable=self.save_text_var
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=3)
-
-        row += 1
         self.create_folder_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             frm, text="Also create results_... folder with per-query .txt/.md files "
@@ -1003,7 +996,7 @@ class JobSearchApp:
         region = self.region_combo.get() or "Germany"
         apply_filter = self.filter_var.get()
         broad_match = self.broad_match_var.get()
-        save_text = self.save_text_var.get()
+        save_text = True  # posting text is always saved to .md
         create_folder = self.create_folder_var.get()
         group1 = parse_keywords(self.group1_entry.get())
         group2 = parse_keywords(self.group2_entry.get())
