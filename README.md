@@ -1,4 +1,4 @@
-# Job Search GUI (Indeed, LinkedIn, Stepstone)
+# Job Search GUI
 
 ## Run on Windows
 1. Install Python 3.9+ from python.org (check "Add to PATH" during install).
@@ -23,4 +23,8 @@ internal driver files are bundled correctly.
 
 Note: the .exe still needs Playwright's Chromium on the machine it runs on
 (used by Indeed and Stepstone). If it isn't installed yet, open Command Prompt
+
+## AI Disclosure
+
+This project was developed with the assistance of an AI agent (Claude). While AI was utilized to accelerate the development process, autocomplete boilerplate code, and assist with initial drafting, core architectures and integrations have been reviewed and tested by human maintainers.
 and run `pip install playwright` followed by `playwright install chromium`.
