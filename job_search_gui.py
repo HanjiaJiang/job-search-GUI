@@ -72,15 +72,15 @@ FALLBACK_TEXT_LIMIT = 8000       # max chars saved when only whole-page text was
 BLOCKED_PAGE_MIN_CHARS = 300     # whole-page text shorter than this = probably a block page
 
 DEFAULT_QUERIES = [
-    "biomedical python",
-    "biomedical simulation",
-    "biomedical algorithm",
-    "neural engineering",
-    "brain computer interface",
+    "",
+    "",
+    "",
+    "",
+    "",
 ]
 
-DEFAULT_GROUP1 = "engineer, scientist, software, simulat, python, C++, algor"
-DEFAULT_GROUP2 = "bio, medic, clinic, physio, neur"
+DEFAULT_GROUP1 = ""
+DEFAULT_GROUP2 = ""
 
 HEADERS = {
     "User-Agent": (
